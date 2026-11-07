@@ -81,8 +81,17 @@ void entitySortTranslucents(const Vector3 &cameraPosition)
 #endif
 }
 
+// attachments of the viewmodel, captured right after its events pass
+static bool s_viewAttachValid;
+static Vector3 s_viewAttach[4];
+
 void entityDrawViewmodel(int drawFlags)
 {
+    if (drawFlags & STUDIO_EVENTS)
+    {
+        s_viewAttachValid = false;
+    }
+
     // FIXME: r_drawviewmodel and others...
     cl_entity_t *viewmodel = g_engfuncs.GetViewModel();
 
@@ -109,6 +118,18 @@ void entityDrawViewmodel(int drawFlags)
         internalUpdateViewmodelAnimation(viewmodel);
 
         studioProxyDrawEntity(drawFlags, viewmodel, 1);
+
+        if (drawFlags & STUDIO_EVENTS)
+        {
+            // the client copies these into the local player's entity too, but the player's
+            // own (third person) model can overwrite them again before sprites get drawn
+            for (int i = 0; i < 4; i++)
+            {
+                s_viewAttach[i] = viewmodel->attachment[i];
+            }
+
+            s_viewAttachValid = true;
+        }
 
         studioEndModels();
     }
@@ -411,6 +432,11 @@ int AddEntity(int type, struct cl_entity_s *entity)
         return 1;
     }
 
+    if (model->type == mod_sprite)
+    {
+        g_spriteStats.added++;
+    }
+
     BucketIndex bucketIndex;
 
     // check if it's translucent
@@ -481,6 +507,67 @@ void entityClearBuckets()
     {
         bucket.count = 0;
     }
+
+    s_viewAttachValid = false;
+}
+
+void entityMoveAiments()
+{
+    // same thing the engine does for the entities in its visible list:
+    // if (ent->aiment && ent->movetype == MOVETYPE_FOLLOW) ent->origin = aiment->origin
+    for (int b = 0; b < BucketCount; b++)
+    {
+        if (b == BucketBeam)
+        {
+            continue;
+        }
+
+        const Bucket &bucket = s_buckets[b];
+
+        for (int i = 0; i < bucket.count; i++)
+        {
+            cl_entity_t *entity = bucket.entities[i];
+
+            if (!entity->curstate.aiment || entity->curstate.movetype != MOVETYPE_FOLLOW)
+            {
+                continue;
+            }
+
+            if (entity->curstate.aiment < 0 || entity->curstate.aiment >= g_state.maxEntities)
+            {
+                continue;
+            }
+
+            cl_entity_t *aiment = g_engfuncs.GetEntityByIndex(entity->curstate.aiment);
+            if (aiment && aiment != entity)
+            {
+                entity->origin = aiment->origin;
+                g_spriteStats.followMoved++;
+            }
+        }
+    }
+
+    spriteDebugReport();
+}
+
+Vector3 entityGetAttachmentPoint(cl_entity_t *entity, int attachmentIndex)
+{
+    if (attachmentIndex <= 0)
+    {
+        return entity->origin;
+    }
+
+    if (attachmentIndex > 4)
+    {
+        attachmentIndex = 4;
+    }
+
+    if (s_viewAttachValid && entity == g_engfuncs.GetLocalPlayer())
+    {
+        return s_viewAttach[attachmentIndex - 1];
+    }
+
+    return entity->attachment[attachmentIndex - 1];
 }
 
 cl_entity_t **entityGetBeams(int &count)

@@ -22,6 +22,9 @@ void beamSetup(
 
 cl_entity_t *beamGetBeamEntity(int index);
 
+// TE_KILLBEAM: detach/retire every beam attached to the given entity
+void beamKillEntity(int deadEntity);
+
 void beamDraw();
 
 }

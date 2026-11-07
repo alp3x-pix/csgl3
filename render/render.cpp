@@ -686,6 +686,9 @@ static void SceneRenderPass(const SceneParams &params, bool onlyClientDraw)
 {
     SetupViewport(params);
 
+    // FOLLOW entities need their aiment's origin before they get sorted and drawn
+    entityMoveAiments();
+
     entitySortTranslucents(params.origin);
 
     lightstyleUpdate();

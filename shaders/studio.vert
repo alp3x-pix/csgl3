@@ -77,6 +77,13 @@ vec2 ChromeTexCoords(mat3x4 bone, vec3 normal)
     texCoords.x = 0.5 - 0.5 * dot(normal, side);
     texCoords.y = 0.5 + 0.5 * dot(normal, up);
 
+    // viewmodel chrome follows the camera so it keeps moving while you look around
+    if (viewmodel)
+    {
+        texCoords.x += atan(cameraRight.x, -cameraRight.y) * 0.3183099;
+        texCoords.y += forward.z * 0.30;
+    }
+
     return texCoords;
 }
 

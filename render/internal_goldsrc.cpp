@@ -1091,6 +1091,35 @@ static goldsrc::mspriteframe_t *GetSpriteFrame(goldsrc::msprite_t *sprite, int f
         frame = 0;
     }
 
+    if (sprite->frames[frame].type == goldsrc::SPR_GROUP)
+    {
+        // animated frame group, pick the sub frame from the client time like the engine does
+        goldsrc::mspritegroup_t *group = (goldsrc::mspritegroup_t *)sprite->frames[frame].frameptr;
+        if (!group || group->numframes <= 0 || !group->intervals)
+        {
+            return nullptr;
+        }
+
+        int index = 0;
+        float fullInterval = group->intervals[group->numframes - 1];
+
+        if (fullInterval > 0.0f)
+        {
+            float time = g_engfuncs.GetClientTime();
+            float target = time - floorf(time / fullInterval) * fullInterval;
+
+            for (index = 0; index < group->numframes - 1; index++)
+            {
+                if (group->intervals[index] > target)
+                {
+                    break;
+                }
+            }
+        }
+
+        return group->frames[index];
+    }
+
     if (sprite->frames[frame].type != goldsrc::SPR_SINGLE)
     {
         return nullptr;

@@ -24,6 +24,36 @@ constexpr auto MaxBeams = 128;
 
 static BEAM s_beams[MaxBeams];
 
+// the BEAM struct has no room for these so keep them on the side, indexed like s_beams
+constexpr int MaxTrailPoints = 128;
+constexpr float TrailPointSpacing = 12.0f;
+
+struct TrailPoint
+{
+    Vector3 origin;
+    float die;
+};
+
+static TrailPoint s_trailPoints[MaxBeams][MaxTrailPoints]; // newest first
+static int s_trailCount[MaxBeams];
+static float s_beamBirth[MaxBeams];
+static float s_beamLife[MaxBeams];
+
+// returns -1 for beams that don't live in the pool (entity beams)
+static int BeamIndex(const BEAM &beam)
+{
+    uintptr_t address = reinterpret_cast<uintptr_t>(&beam);
+    uintptr_t first = reinterpret_cast<uintptr_t>(&s_beams[0]);
+    uintptr_t last = reinterpret_cast<uintptr_t>(&s_beams[MaxBeams - 1]);
+
+    if (address < first || address > last)
+    {
+        return -1;
+    }
+
+    return static_cast<int>(&beam - s_beams);
+}
+
 // need to use these shitty lists to stay compatible
 static BEAM *s_freeBeams;
 static BEAM *s_activeBeams;
@@ -63,6 +93,11 @@ BEAM *beamAllocate()
     beam->next = s_activeBeams;
     s_activeBeams = beam;
 
+    int index = BeamIndex(*beam);
+    s_trailCount[index] = 0;
+    s_beamBirth[index] = g_engfuncs.GetClientTime();
+    s_beamLife[index] = 0;
+
     return beam;
 }
 
@@ -80,10 +115,23 @@ void beamSetup(
     model_t *model = g_engineStudio.GetModelByIndex(modelIndex);
     if (!model)
     {
+        // make sure the (already allocated) beam gets thrown away instead of drawing stale data
+        beam.modelIndex = -1;
+        beam.flags = 0;
+        beam.die = 0;
         return;
     }
 
     float clientTime = g_engfuncs.GetClientTime();
+
+    {
+        int index = BeamIndex(beam);
+        if (index >= 0)
+        {
+            s_beamBirth[index] = clientTime;
+            s_beamLife[index] = life;
+        }
+    }
 
     beam.type = TE_BEAMPOINTS;
     beam.modelIndex = modelIndex;
@@ -278,36 +326,396 @@ static void DrawSegs(const Vector3 &source, const Vector3 &delta, float width, f
     }
 }
 
-static void DrawTorus(const Vector3 &source, const Vector3 &delta, float width, float scale, float freq, float speed, int segments)
+// ---------------------------------------------------------------------------
+// circle beams (TE_BEAMTORUS / TE_BEAMDISK / TE_BEAMCYLINDER / TE_BEAMRING)
+// not a port of the engine's code, written from how the effects are documented
+// ("expands to max radius over lifetime"), so details may differ a bit
+// ---------------------------------------------------------------------------
+
+constexpr int CircleSegments = 64;
+
+static float BeamElapsed(const BEAM &beam)
 {
-    NOT_IMPL();
+    int index = BeamIndex(beam);
+    if (index < 0)
+    {
+        return 0;
+    }
+
+    return Q_max(g_engfuncs.GetClientTime() - s_beamBirth[index], 0.0f);
 }
 
-static void DrawDisk(const Vector3 &source, const Vector3 &delta, float width, float scale, float freq, float speed, int segments)
+// the engine uses freq * delta[2] as the radius, with freq being the beam's age
+static float CircleRadius(const BEAM &beam)
 {
-    NOT_IMPL();
+    float rate = fabsf(beam.delta.z);
+    if (rate < 0.001f)
+    {
+        rate = VectorLength(beam.delta);
+    }
+
+    return BeamElapsed(beam) * rate;
 }
 
-static void DrawCylinder(const Vector3 &source, const Vector3 &delta, float width, float scale, float freq, float speed, int segments)
+// whole number of texture repeats around a circle so there's no visible seam
+static float CircleRepeats(float radius, float tileLength)
 {
-    NOT_IMPL();
+    return Q_max(1.0f, floorf((2.0f * F_PI * radius) / tileLength));
 }
+
+static void DrawTorus(const BEAM &beam)
+{
+    float radius = CircleRadius(beam);
+    if (radius < 0.5f)
+    {
+        return;
+    }
+
+    float repeats = CircleRepeats(radius, 64.0f);
+    const float width = beam.width;
+
+    for (int i = 0; i <= CircleSegments; i++)
+    {
+        float fraction = (float)i / (float)CircleSegments;
+        float angle = 2.0f * F_PI * fraction;
+        float s = sinf(angle);
+        float c = cosf(angle);
+
+        Vector3 point = beam.source + Vector3{ s * radius, c * radius, 0 };
+        Vector3 tangent = { c, -s, 0 };
+
+        // screen aligned like the beams, thick band that always faces the viewer
+        Vector3 screen0 = ScreenTransform(point);
+        Vector3 screen1 = ScreenTransform(point + tangent * 8.0f);
+
+        Vector3 tmp = screen1 - screen0;
+        tmp.z = 0;
+        if (VectorLengthSquared(tmp) < 1e-8f)
+        {
+            tmp = { 1, 0, 0 };
+        }
+        VectorNormalize(tmp);
+
+        Vector3 normal = (g_state.viewUp * tmp.x) - (g_state.viewRight * tmp.y);
+
+        Vector3 v1 = point + normal * width;
+        Vector3 v2 = point - normal * width;
+
+        float v = fraction * repeats;
+
+        g_triapiGL3.TexCoord2f(0, v);
+        g_triapiGL3.Vertex3fv(&v1.x);
+        g_triapiGL3.TexCoord2f(1, v);
+        g_triapiGL3.Vertex3fv(&v2.x);
+    }
+}
+
+static void DrawDisk(const BEAM &beam)
+{
+    float radius = CircleRadius(beam);
+    if (radius < 0.5f)
+    {
+        return;
+    }
+
+    float repeats = CircleRepeats(radius, 64.0f);
+
+    for (int i = 0; i <= CircleSegments; i++)
+    {
+        float fraction = (float)i / (float)CircleSegments;
+        float angle = 2.0f * F_PI * fraction;
+
+        Vector3 center = beam.source;
+        Vector3 edge = beam.source + Vector3{ sinf(angle) * radius, cosf(angle) * radius, 0 };
+
+        float v = fraction * repeats;
+
+        g_triapiGL3.TexCoord2f(0, v);
+        g_triapiGL3.Vertex3fv(&center.x);
+        g_triapiGL3.TexCoord2f(1, v);
+        g_triapiGL3.Vertex3fv(&edge.x);
+    }
+}
+
+static void DrawCylinder(const BEAM &beam)
+{
+    float radius = CircleRadius(beam);
+    if (radius < 0.5f)
+    {
+        return;
+    }
+
+    float repeats = CircleRepeats(radius, 64.0f);
+    const float height = Q_max(beam.width, 1.0f);
+
+    for (int i = 0; i <= CircleSegments; i++)
+    {
+        float fraction = (float)i / (float)CircleSegments;
+        float angle = 2.0f * F_PI * fraction;
+
+        float x = sinf(angle) * radius;
+        float y = cosf(angle) * radius;
+
+        Vector3 top = beam.source + Vector3{ x, y, height };
+        Vector3 bottom = beam.source + Vector3{ x, y, -height };
+
+        float v = fraction * repeats;
+
+        g_triapiGL3.TexCoord2f(1, v);
+        g_triapiGL3.Vertex3fv(&top.x);
+        g_triapiGL3.TexCoord2f(0, v);
+        g_triapiGL3.Vertex3fv(&bottom.x);
+    }
+}
+
+// ring between two points: a circle facing the viewer whose diameter is the line source -> source + delta
+static void DrawRing(const BEAM &beam)
+{
+    float diameter = VectorLength(beam.delta);
+    if (diameter < 1.0f)
+    {
+        return;
+    }
+
+    float radius = diameter * 0.5f;
+    Vector3 center = beam.source + beam.delta * 0.5f;
+
+    Vector3 axis = beam.delta * (1.0f / diameter);
+
+    Vector3 side = Cross(axis, g_state.viewForward);
+    if (VectorLengthSquared(side) < 1e-6f)
+    {
+        side = Cross(axis, g_state.viewUp);
+    }
+    VectorNormalize(side);
+
+    const int segments = 48;
+    float repeats = CircleRepeats(radius, 64.0f);
+    const float width = beam.width;
+
+    for (int i = 0; i <= segments; i++)
+    {
+        float fraction = (float)i / (float)segments;
+        float angle = 2.0f * F_PI * fraction;
+
+        // outward direction of the ring at this point
+        Vector3 outward = axis * cosf(angle) + side * sinf(angle);
+        Vector3 point = center + outward * radius;
+
+        Vector3 v1 = point + outward * width;
+        Vector3 v2 = point - outward * width;
+
+        float v = fraction * repeats;
+
+        g_triapiGL3.TexCoord2f(0, v);
+        g_triapiGL3.Vertex3fv(&v1.x);
+        g_triapiGL3.TexCoord2f(1, v);
+        g_triapiGL3.Vertex3fv(&v2.x);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TE_BEAMFOLLOW: a trail of fading segments behind an entity
+// R_BeamFollow stores the segment lifetime in amplitude
+// ---------------------------------------------------------------------------
 
 static void DrawBeamFollow(BEAM &beam, float frametime)
 {
-    NOT_IMPL();
+    int index = BeamIndex(beam);
+    if (index < 0)
+    {
+        return;
+    }
+
+    float now = g_engfuncs.GetClientTime();
+    float life = Q_max(beam.amplitude, 0.1f);
+
+    TrailPoint *points = s_trailPoints[index];
+    int count = s_trailCount[index];
+
+    // oldest points are at the end of the list
+    while (count > 0 && points[count - 1].die < now)
+    {
+        count--;
+    }
+
+    // still attached to a live entity?
+    bool tracking = (beam.flags & FBEAM_STARTENTITY) != 0;
+
+    if (tracking)
+    {
+        // the beam lives as long as the entity does
+        beam.die = now + life;
+
+        if (count == 0 || VectorLength(points[0].origin - beam.source) >= TrailPointSpacing)
+        {
+            if (count == MaxTrailPoints)
+            {
+                count--;
+            }
+
+            for (int i = count; i > 0; i--)
+            {
+                points[i] = points[i - 1];
+            }
+
+            points[0].origin = beam.source;
+            points[0].die = now + life;
+            count++;
+        }
+    }
+
+    s_trailCount[index] = count;
+
+    if (!tracking && count == 0)
+    {
+        // entity is gone and the whole trail has faded out
+        beam.die = now - 1.0f;
+        return;
+    }
+
+    Vector3 positions[MaxTrailPoints + 1];
+    float brightness[MaxTrailPoints + 1];
+    int nodes = 0;
+
+    if (tracking)
+    {
+        positions[nodes] = beam.source;
+        brightness[nodes] = 1.0f;
+        nodes++;
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        positions[nodes] = points[i].origin;
+        brightness[nodes] = Q_clamp((points[i].die - now) / life, 0.0f, 1.0f);
+        nodes++;
+    }
+
+    if (nodes < 2)
+    {
+        return;
+    }
+
+    // screen space direction of every segment
+    Vector3 screen[MaxTrailPoints + 1];
+    for (int i = 0; i < nodes; i++)
+    {
+        screen[i] = ScreenTransform(positions[i]);
+    }
+
+    Vector3 segmentDir[MaxTrailPoints + 1];
+    for (int i = 0; i < nodes - 1; i++)
+    {
+        Vector3 dir = screen[i + 1] - screen[i];
+        dir.z = 0;
+        if (VectorLengthSquared(dir) < 1e-8f)
+        {
+            dir = (i > 0) ? segmentDir[i - 1] : Vector3{ 1, 0, 0 };
+        }
+        VectorNormalize(dir);
+        segmentDir[i] = dir;
+    }
+
+    // per node normals, averaged between the adjoining segments so the trail has no gaps
+    Vector3 normals[MaxTrailPoints + 1];
+    for (int i = 0; i < nodes; i++)
+    {
+        Vector3 dir;
+        if (i == 0)
+        {
+            dir = segmentDir[0];
+        }
+        else if (i == nodes - 1)
+        {
+            dir = segmentDir[nodes - 2];
+        }
+        else
+        {
+            dir = segmentDir[i - 1] + segmentDir[i];
+            if (VectorLengthSquared(dir) < 1e-8f)
+            {
+                dir = segmentDir[i];
+            }
+            VectorNormalize(dir);
+        }
+
+        normals[i] = (g_state.viewUp * dir.x) - (g_state.viewRight * dir.y);
+    }
+
+    const float width = beam.width;
+
+    for (int i = 0; i < nodes - 1; i++)
+    {
+        Vector3 a1 = positions[i] + normals[i] * width;
+        Vector3 a2 = positions[i] - normals[i] * width;
+        Vector3 b1 = positions[i + 1] + normals[i + 1] * width;
+        Vector3 b2 = positions[i + 1] - normals[i + 1] * width;
+
+        // every segment maps the whole texture once
+        g_triapiGL3.Brightness(brightness[i]);
+        g_triapiGL3.TexCoord2f(0, 0);
+        g_triapiGL3.Vertex3fv(&a1.x);
+
+        g_triapiGL3.Brightness(brightness[i]);
+        g_triapiGL3.TexCoord2f(1, 0);
+        g_triapiGL3.Vertex3fv(&a2.x);
+
+        g_triapiGL3.Brightness(brightness[i + 1]);
+        g_triapiGL3.TexCoord2f(1, 1);
+        g_triapiGL3.Vertex3fv(&b2.x);
+
+        g_triapiGL3.Brightness(brightness[i + 1]);
+        g_triapiGL3.TexCoord2f(0, 1);
+        g_triapiGL3.Vertex3fv(&b1.x);
+    }
 }
 
-static void DrawRing(const Vector3 &source, const Vector3 &delta, float width, float amplitude, float freq, float speed, int segments)
+void beamKillEntity(int deadEntity)
 {
-    NOT_IMPL();
+    float now = g_engfuncs.GetClientTime();
+
+    for (BEAM *beam = s_activeBeams; beam; beam = beam->next)
+    {
+        bool killed = false;
+
+        if ((beam->flags & FBEAM_STARTENTITY) && BEAMENT_ENTITY(beam->startEntity) == deadEntity)
+        {
+            beam->flags &= ~(FBEAM_STARTENTITY | FBEAM_STARTVISIBLE);
+            killed = true;
+        }
+
+        if ((beam->flags & FBEAM_ENDENTITY) && BEAMENT_ENTITY(beam->endEntity) == deadEntity)
+        {
+            beam->flags &= ~(FBEAM_ENDENTITY | FBEAM_ENDVISIBLE);
+            killed = true;
+        }
+
+        if (!killed)
+        {
+            continue;
+        }
+
+        beam->flags &= ~FBEAM_FOREVER;
+
+        if (beam->type == TE_BEAMFOLLOW)
+        {
+            // let the trail fade out instead of vanishing
+            beam->die = now + Q_max(beam->amplitude, 0.1f);
+        }
+        else
+        {
+            beam->die = now - 1.0f;
+        }
+    }
 }
 
 static Vector3 GetAttachmentPoint(cl_entity_t *entity, int attachmentIndex)
 {
     if (attachmentIndex)
     {
-        return entity->attachment[attachmentIndex - 1];
+        // local player: viewmodel attachments in first person
+        return entityGetAttachmentPoint(entity, attachmentIndex);
     }
 
     if (entity == g_engfuncs.GetLocalPlayer())
@@ -442,7 +850,7 @@ static void DrawBeam(BEAM &beam, float frametime)
         return;
     }
 
-    int frame = static_cast<int>(beam.frameRate * clientTime + beam.frame) % beam.frameCount;
+    int frame = static_cast<int>(beam.frameRate * clientTime + beam.frame) % Q_max(beam.frameCount, 1);
     if (!g_triapiGL3.SpriteTexture(model, frame))
     {
         return;
@@ -485,40 +893,19 @@ static void DrawBeam(BEAM &beam, float frametime)
 
     case TE_BEAMTORUS:
         g_triapiGL3.Begin(TRI_QUAD_STRIP);
-        DrawTorus(
-            beam.source,
-            beam.delta,
-            beam.width,
-            beam.amplitude,
-            beam.freq,
-            beam.speed,
-            beam.segments);
+        DrawTorus(beam);
         g_triapiGL3.End();
         break;
 
     case TE_BEAMDISK:
         g_triapiGL3.Begin(TRI_QUAD_STRIP);
-        DrawDisk(
-            beam.source,
-            beam.delta,
-            beam.width,
-            beam.amplitude,
-            beam.freq,
-            beam.speed,
-            beam.segments);
+        DrawDisk(beam);
         g_triapiGL3.End();
         break;
 
     case TE_BEAMCYLINDER:
         g_triapiGL3.Begin(TRI_QUAD_STRIP);
-        DrawCylinder(
-            beam.source,
-            beam.delta,
-            beam.width,
-            beam.amplitude,
-            beam.freq,
-            beam.speed,
-            beam.segments);
+        DrawCylinder(beam);
         g_triapiGL3.End();
         break;
 
@@ -530,14 +917,7 @@ static void DrawBeam(BEAM &beam, float frametime)
 
     case TE_BEAMRING:
         g_triapiGL3.Begin(TRI_QUAD_STRIP);
-        DrawRing(
-            beam.source,
-            beam.delta,
-            beam.width,
-            beam.amplitude,
-            beam.freq,
-            beam.speed,
-            beam.segments);
+        DrawRing(beam);
         g_triapiGL3.End();
         break;
     }

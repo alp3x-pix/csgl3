@@ -2,6 +2,7 @@
 #include "sprite.h"
 #include "immediate.h"
 #include "internal.h"
+#include "entity.h"
 
 // not all sdks come with spritegn.h so define these here
 #define SPR_VP_PARALLEL_UPRIGHT 0
@@ -17,10 +18,39 @@ static bool s_alphaBlend;
 static int s_rendermode = -1;
 
 static cvar_t *r_traceglow;
+static cvar_t *gl3_debug;
+
+SpriteStats g_spriteStats;
 
 void spriteInit()
 {
     r_traceglow = g_engfuncs.pfnGetCvarPointer("r_traceglow");
+    gl3_debug = g_engfuncs.pfnRegisterVariable("gl3_debug", "0", 0);
+}
+
+void spriteDebugReport()
+{
+    if (!gl3_debug || !gl3_debug->value)
+    {
+        g_spriteStats = {};
+        return;
+    }
+
+    static float nextReport;
+    float now = g_engfuncs.GetClientTime();
+
+    if (now < nextReport)
+    {
+        return;
+    }
+
+    nextReport = now + 2.0f;
+
+    const SpriteStats &st = g_spriteStats;
+    g_engfuncs.Con_Printf("[gl3] sprites: added %d drawn %d noframe %d culled %d billboard %d attached %d | follow moved %d\n",
+        st.added, st.drawn, st.noFrame, st.culled, st.billboard, st.attached, st.followMoved);
+
+    g_spriteStats = {};
 }
 
 void spriteBegin(bool alphaBlend)
@@ -213,20 +243,18 @@ static void EmitVertex(const Vector3 &position, const Vector2 &texCoord)
 
 static void GetAttachmentPoint(Vector3 &point, int entityIndex, int attachmentIndex)
 {
+    if (entityIndex < 0 || entityIndex >= g_state.maxEntities)
+    {
+        return;
+    }
+
     cl_entity_t *entity = g_engfuncs.GetEntityByIndex(entityIndex);
     if (!entity)
     {
         return;
     }
 
-    if (attachmentIndex)
-    {
-        point = entity->attachment[attachmentIndex - 1];
-    }
-    else
-    {
-        point = entity->origin;
-    }
+    point = entityGetAttachmentPoint(entity, attachmentIndex);
 }
 
 void spriteDraw(cl_entity_t *entity, float blend)
@@ -234,6 +262,7 @@ void spriteDraw(cl_entity_t *entity, float blend)
     SpriteInfo sprite;
     if (!internalGetSpriteInfo(entity->model, (int)entity->curstate.frame, &sprite))
     {
+        g_spriteStats.noFrame++;
         return;
     }
 
@@ -242,6 +271,7 @@ void spriteDraw(cl_entity_t *entity, float blend)
     if (entity->curstate.body)
     {
         GetAttachmentPoint(origin, entity->curstate.skin, entity->curstate.body);
+        g_spriteStats.attached++;
     }
 
     if (entity->curstate.rendermode == kRenderGlow)
@@ -267,6 +297,7 @@ void spriteDraw(cl_entity_t *entity, float blend)
         if (g_state.viewFrustum.CullSphere(origin, radius))
         {
             // get culled idiot
+            g_spriteStats.culled++;
             return;
         }
     }
@@ -280,6 +311,7 @@ void spriteDraw(cl_entity_t *entity, float blend)
     if (!BillboardSprite(entity, sprite.type, right, up))
     {
         // not visible
+        g_spriteStats.billboard++;
         return;
     }
 
@@ -296,6 +328,8 @@ void spriteDraw(cl_entity_t *entity, float blend)
 
     immediateBindTexture(sprite.texture);
     immediateColor4f(color.x, color.y, color.z, color.w);
+
+    g_spriteStats.drawn++;
 
     immediateBegin(GL_QUADS);
     EmitVertex(vertices[0], { 0, 1 });

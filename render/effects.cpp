@@ -584,8 +584,28 @@ static BEAM *R_BeamCirclePoints(int type, float *start, float *end, int modelInd
         return s_engineEfx.R_BeamCirclePoints(type, start, end, modelIndex, life, width, amplitude, brightness, speed, startFrame, framerate, r, g, b);
     }
 
-    NOT_IMPL();
-    return {};
+    if (modelIndex < 0)
+    {
+        return nullptr;
+    }
+
+    BEAM *beam = beamAllocate();
+    if (!beam)
+    {
+        return nullptr;
+    }
+
+    beamSetup(*beam, start, end, modelIndex, life, width, amplitude, brightness, speed);
+
+    beam->type = type;
+    beam->flags = 0;
+    beam->frameRate = framerate;
+    beam->frame = static_cast<float>(startFrame);
+    beam->r = r;
+    beam->g = g;
+    beam->b = b;
+
+    return beam;
 }
 
 static BEAM *R_BeamEntPoint(int startEnt, float *end, int modelIndex, float life, float width, float amplitude, float brightness, float speed, int startFrame, float framerate, float r, float g, float b)
@@ -635,6 +655,55 @@ static BEAM *R_BeamEntPoint(int startEnt, float *end, int modelIndex, float life
     return beam;
 }
 
+// shared by R_BeamEnts and R_BeamRing, a beam that's attached to two entities
+static BEAM *BeamBetweenEntities(int type, int startEnt, int endEnt, int modelIndex, float life, float width, float amplitude, float brightness, float speed, int startFrame, float framerate, float r, float g, float b)
+{
+    if (modelIndex < 0)
+    {
+        return nullptr;
+    }
+
+    bool forever = (life == 0.0f);
+
+    cl_entity_t *startEntity = beamGetBeamEntity(startEnt);
+    cl_entity_t *endEntity = beamGetBeamEntity(endEnt);
+    if (!startEntity || !endEntity)
+    {
+        return nullptr;
+    }
+
+    if ((!startEntity->model || !endEntity->model) && !forever)
+    {
+        return nullptr;
+    }
+
+    BEAM *beam = beamAllocate();
+    if (!beam)
+    {
+        return nullptr;
+    }
+
+    beamSetup(*beam, Vector3{}, Vector3{}, modelIndex, life, width, amplitude, brightness, speed);
+
+    beam->type = type;
+    beam->flags |= FBEAM_STARTENTITY | FBEAM_ENDENTITY;
+
+    if (forever)
+    {
+        beam->flags |= FBEAM_FOREVER;
+    }
+
+    beam->startEntity = startEnt;
+    beam->endEntity = endEnt;
+    beam->frameRate = framerate;
+    beam->frame = static_cast<float>(startFrame);
+    beam->r = r;
+    beam->g = g;
+    beam->b = b;
+
+    return beam;
+}
+
 static BEAM *R_BeamEnts(int startEnt, int endEnt, int modelIndex, float life, float width, float amplitude, float brightness, float speed, int startFrame, float framerate, float r, float g, float b)
 {
     if (!g_state.active)
@@ -642,8 +711,7 @@ static BEAM *R_BeamEnts(int startEnt, int endEnt, int modelIndex, float life, fl
         return s_engineEfx.R_BeamEnts(startEnt, endEnt, modelIndex, life, width, amplitude, brightness, speed, startFrame, framerate, r, g, b);
     }
 
-    NOT_IMPL();
-    return {};
+    return BeamBetweenEntities(TE_BEAMPOINTS, startEnt, endEnt, modelIndex, life, width, amplitude, brightness, speed, startFrame, framerate, r, g, b);
 }
 
 static BEAM *R_BeamFollow(int startEnt, int modelIndex, float life, float width, float r, float g, float b, float brightness)
@@ -685,7 +753,7 @@ static void R_BeamKill(int deadEntity)
         return s_engineEfx.R_BeamKill(deadEntity);
     }
 
-    NOT_IMPL();
+    beamKillEntity(deadEntity);
 }
 
 static BEAM *R_BeamLightning(float *start, float *end, int modelIndex, float life, float width, float amplitude, float brightness, float speed)
@@ -695,8 +763,27 @@ static BEAM *R_BeamLightning(float *start, float *end, int modelIndex, float lif
         return s_engineEfx.R_BeamLightning(start, end, modelIndex, life, width, amplitude, brightness, speed);
     }
 
-    NOT_IMPL();
-    return {};
+    if (modelIndex < 0)
+    {
+        return nullptr;
+    }
+
+    BEAM *beam = beamAllocate();
+    if (!beam)
+    {
+        return nullptr;
+    }
+
+    // TE_LIGHTNING is just a beam without the color / frame parameters
+    beamSetup(*beam, start, end, modelIndex, life, width, amplitude, brightness, speed);
+
+    beam->frameRate = 0;
+    beam->frame = 0;
+    beam->r = 1.0f;
+    beam->g = 1.0f;
+    beam->b = 1.0f;
+
+    return beam;
 }
 
 static BEAM *R_BeamPoints(float *start, float *end, int modelIndex, float life, float width, float amplitude, float brightness, float speed, int startFrame, float framerate, float r, float g, float b)
@@ -742,8 +829,7 @@ static BEAM *R_BeamRing(int startEnt, int endEnt, int modelIndex, float life, fl
         return s_engineEfx.R_BeamRing(startEnt, endEnt, modelIndex, life, width, amplitude, brightness, speed, startFrame, framerate, r, g, b);
     }
 
-    NOT_IMPL();
-    return {};
+    return BeamBetweenEntities(TE_BEAMRING, startEnt, endEnt, modelIndex, life, width, amplitude, brightness, speed, startFrame, framerate, r, g, b);
 }
 
 static dlight_t *CL_AllocDlight(int k)

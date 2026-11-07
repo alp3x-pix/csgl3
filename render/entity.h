@@ -25,6 +25,16 @@ int entityUpdateRenderAmt(cl_entity_t *entity, const Vector3 &origin, const Vect
 // clears all entities marked to draw this frame
 void entityClearBuckets();
 
+// emulates the engine's CL_MoveAiments for the entities we took over from the engine:
+// the engine only walks its own visible entity list, so MOVETYPE_FOLLOW entities that
+// we draw (sprites, models...) would never get the origin of their aiment otherwise
+void entityMoveAiments();
+
+// returns the world space position of an entity's attachment (1 based), or the entity's
+// origin when attachmentIndex is 0. in first person, the local player's attachments are
+// taken straight from the viewmodel so effects (muzzleflashes etc.) line up with the gun
+Vector3 entityGetAttachmentPoint(cl_entity_t *entity, int attachmentIndex);
+
 // get beam entities added for this frame
 cl_entity_t **entityGetBeams(int &count);
 
