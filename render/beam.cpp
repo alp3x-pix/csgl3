@@ -37,6 +37,7 @@ struct TrailPoint
 static TrailPoint s_trailPoints[MaxBeams][MaxTrailPoints]; // newest first
 static int s_trailCount[MaxBeams];
 static float s_beamBirth[MaxBeams];
+static float s_beamLastLive[MaxBeams]; // last time the followed entity was part of a server update
 static float s_beamLife[MaxBeams];
 
 // returns -1 for beams that don't live in the pool (entity beams)
@@ -52,6 +53,38 @@ static int BeamIndex(const BEAM &beam)
     }
 
     return static_cast<int>(&beam - s_beams);
+}
+
+// a trail whose entity has been missing from the server updates for this long is considered orphaned
+// (entities buried inside a wall or outside the PVS are not sent for a while, that must not end the trail)
+constexpr float BeamFollowGrace = 0.25f;
+
+// an entity that jumps further than this between two frames is a different entity (reused slot) or a teleport
+constexpr float MaxTrailJump = 512.0f;
+
+// is the entity part of the most recent server update?
+// cl_entities slots keep their old origin and model forever after the entity is gone
+static bool BeamEntityIsLive(const cl_entity_t *entity)
+{
+    cl_entity_t *local = g_engfuncs.GetLocalPlayer();
+    if (!entity || !local)
+    {
+        return false;
+    }
+
+    if (entity == local)
+    {
+        return true;
+    }
+
+    return entity->curstate.messagenum == local->curstate.messagenum;
+}
+
+// stop following the entity but let the trail that is left fade away (TE_BEAMFOLLOW stores the life in amplitude)
+static void BeamDetachFollow(BEAM &beam, float now)
+{
+    beam.flags &= ~(FBEAM_STARTENTITY | FBEAM_STARTVISIBLE | FBEAM_FOREVER);
+    beam.die = now + Q_max(beam.amplitude, 0.1f);
 }
 
 // need to use these shitty lists to stay compatible
@@ -96,6 +129,7 @@ BEAM *beamAllocate()
     int index = BeamIndex(*beam);
     s_trailCount[index] = 0;
     s_beamBirth[index] = g_engfuncs.GetClientTime();
+    s_beamLastLive[index] = s_beamBirth[index];
     s_beamLife[index] = 0;
 
     return beam;
@@ -129,6 +163,7 @@ void beamSetup(
         if (index >= 0)
         {
             s_beamBirth[index] = clientTime;
+            s_beamLastLive[index] = clientTime;
             s_beamLife[index] = life;
         }
     }
@@ -519,6 +554,105 @@ static void DrawRing(const BEAM &beam)
 // R_BeamFollow stores the segment lifetime in amplitude
 // ---------------------------------------------------------------------------
 
+// trail geometry closer than this to the camera is not drawn, it fades in over the next TrailFadeDistance units
+constexpr float TrailNearDistance = 12.0f;
+constexpr float TrailFadeDistance = 36.0f;
+
+// the ribbon is never wider than this fraction of the screen height (per side), so trails passing close to
+// the camera stay thin instead of filling the screen
+constexpr float TrailMaxHalfWidth = 0.02f;
+
+static void DrawFollowRun(const Vector3 *positions, const float *brightness, const float *depth, int nodes, float width)
+{
+    if (nodes < 2)
+    {
+        return;
+    }
+
+    // world units -> pixels at a depth of one unit
+    SCREENINFO screenInfo{};
+    screenInfo.iSize = sizeof(screenInfo);
+    g_engfuncs.pfnGetScreenInfo(&screenInfo);
+    float pixelsPerUnit = g_state.projectionMatrix.m11 * screenInfo.iHeight * 0.5f;
+    float maxHalfPixels = TrailMaxHalfWidth * screenInfo.iHeight;
+
+    // screen space direction of every segment
+    Vector3 screen[MaxTrailPoints + 4];
+    for (int i = 0; i < nodes; i++)
+    {
+        screen[i] = ScreenTransform(positions[i]);
+    }
+
+    Vector3 segmentDir[MaxTrailPoints + 4];
+    for (int i = 0; i < nodes - 1; i++)
+    {
+        Vector3 dir = screen[i + 1] - screen[i];
+        dir.z = 0;
+        if (VectorLengthSquared(dir) < 1e-8f)
+        {
+            dir = (i > 0) ? segmentDir[i - 1] : Vector3{ 1, 0, 0 };
+        }
+        VectorNormalize(dir);
+        segmentDir[i] = dir;
+    }
+
+    // per node normals, averaged between the adjoining segments so the trail has no gaps
+    Vector3 normals[MaxTrailPoints + 4];
+    float halfWidth[MaxTrailPoints + 4];
+    float alpha[MaxTrailPoints + 4];
+    for (int i = 0; i < nodes; i++)
+    {
+        Vector3 dir;
+        if (i == 0)
+        {
+            dir = segmentDir[0];
+        }
+        else if (i == nodes - 1)
+        {
+            dir = segmentDir[nodes - 2];
+        }
+        else
+        {
+            dir = segmentDir[i - 1] + segmentDir[i];
+            if (VectorLengthSquared(dir) < 1e-8f)
+            {
+                dir = segmentDir[i];
+            }
+            VectorNormalize(dir);
+        }
+
+        normals[i] = (g_state.viewUp * dir.x) - (g_state.viewRight * dir.y);
+
+        halfWidth[i] = Q_min(width, maxHalfPixels * depth[i] / Q_max(pixelsPerUnit, 1e-3f));
+        alpha[i] = brightness[i] * Q_clamp((depth[i] - TrailNearDistance) / TrailFadeDistance, 0.0f, 1.0f);
+    }
+
+    for (int i = 0; i < nodes - 1; i++)
+    {
+        Vector3 a1 = positions[i] + normals[i] * halfWidth[i];
+        Vector3 a2 = positions[i] - normals[i] * halfWidth[i];
+        Vector3 b1 = positions[i + 1] + normals[i + 1] * halfWidth[i + 1];
+        Vector3 b2 = positions[i + 1] - normals[i + 1] * halfWidth[i + 1];
+
+        // every segment maps the whole texture once
+        g_triapiGL3.Brightness(alpha[i]);
+        g_triapiGL3.TexCoord2f(0, 0);
+        g_triapiGL3.Vertex3fv(&a1.x);
+
+        g_triapiGL3.Brightness(alpha[i]);
+        g_triapiGL3.TexCoord2f(1, 0);
+        g_triapiGL3.Vertex3fv(&a2.x);
+
+        g_triapiGL3.Brightness(alpha[i + 1]);
+        g_triapiGL3.TexCoord2f(1, 1);
+        g_triapiGL3.Vertex3fv(&b2.x);
+
+        g_triapiGL3.Brightness(alpha[i + 1]);
+        g_triapiGL3.TexCoord2f(0, 1);
+        g_triapiGL3.Vertex3fv(&b1.x);
+    }
+}
+
 static void DrawBeamFollow(BEAM &beam, float frametime)
 {
     int index = BeamIndex(beam);
@@ -546,6 +680,12 @@ static void DrawBeamFollow(BEAM &beam, float frametime)
     {
         // the beam lives as long as the entity does
         beam.die = now + life;
+
+        // the entity jumped (slot reused by a new entity, teleport): don't draw a line across the map
+        if (count > 0 && VectorLength(points[0].origin - beam.source) > MaxTrailJump)
+        {
+            count = 0;
+        }
 
         if (count == 0 || VectorLength(points[0].origin - beam.source) >= TrailPointSpacing)
         {
@@ -576,6 +716,7 @@ static void DrawBeamFollow(BEAM &beam, float frametime)
 
     Vector3 positions[MaxTrailPoints + 1];
     float brightness[MaxTrailPoints + 1];
+    float depth[MaxTrailPoints + 1];
     int nodes = 0;
 
     if (tracking)
@@ -597,77 +738,83 @@ static void DrawBeamFollow(BEAM &beam, float frametime)
         return;
     }
 
-    // screen space direction of every segment
-    Vector3 screen[MaxTrailPoints + 1];
+    // distance in front of the camera, along the view direction
     for (int i = 0; i < nodes; i++)
     {
-        screen[i] = ScreenTransform(positions[i]);
+        depth[i] = Dot(positions[i] - g_state.viewOrigin, g_state.viewForward);
     }
 
-    Vector3 segmentDir[MaxTrailPoints + 1];
-    for (int i = 0; i < nodes - 1; i++)
-    {
-        Vector3 dir = screen[i + 1] - screen[i];
-        dir.z = 0;
-        if (VectorLengthSquared(dir) < 1e-8f)
-        {
-            dir = (i > 0) ? segmentDir[i - 1] : Vector3{ 1, 0, 0 };
-        }
-        VectorNormalize(dir);
-        segmentDir[i] = dir;
-    }
+    // Parts of the trail that are right in front of (or behind) the camera, like the muzzle of the first person
+    // weapon, project to huge, unstable screen coordinates. They are cut off and the trail fades in with distance.
+    // The result is split into runs so that a trail that leaves and re-enters the view isn't joined together.
+    Vector3 runPositions[MaxTrailPoints + 4];
+    float runBrightness[MaxTrailPoints + 4];
+    float runDepth[MaxTrailPoints + 4];
+    int runCount = 0;
 
-    // per node normals, averaged between the adjoining segments so the trail has no gaps
-    Vector3 normals[MaxTrailPoints + 1];
     for (int i = 0; i < nodes; i++)
     {
-        Vector3 dir;
-        if (i == 0)
+        bool in = depth[i] >= TrailNearDistance;
+
+        if (i > 0)
         {
-            dir = segmentDir[0];
-        }
-        else if (i == nodes - 1)
-        {
-            dir = segmentDir[nodes - 2];
-        }
-        else
-        {
-            dir = segmentDir[i - 1] + segmentDir[i];
-            if (VectorLengthSquared(dir) < 1e-8f)
+            bool prevIn = depth[i - 1] >= TrailNearDistance;
+
+            if (in != prevIn)
             {
-                dir = segmentDir[i];
+                // the segment crosses the near limit
+                float t = (TrailNearDistance - depth[i - 1]) / (depth[i] - depth[i - 1]);
+
+                runPositions[runCount] = VectorLerp(positions[i - 1], positions[i], t);
+                runBrightness[runCount] = brightness[i - 1] + (brightness[i] - brightness[i - 1]) * t;
+                runDepth[runCount] = TrailNearDistance;
+                runCount++;
+
+                if (prevIn)
+                {
+                    // leaving the visible region: that ends the run
+                    DrawFollowRun(runPositions, runBrightness, runDepth, runCount, beam.width);
+                    runCount = 0;
+                }
             }
-            VectorNormalize(dir);
         }
 
-        normals[i] = (g_state.viewUp * dir.x) - (g_state.viewRight * dir.y);
+        if (in)
+        {
+            runPositions[runCount] = positions[i];
+            runBrightness[runCount] = brightness[i];
+            runDepth[runCount] = depth[i];
+            runCount++;
+        }
     }
 
-    const float width = beam.width;
+    DrawFollowRun(runPositions, runBrightness, runDepth, runCount, beam.width);
+}
 
-    for (int i = 0; i < nodes - 1; i++)
+void beamDetachFollowers(int entity)
+{
+    float now = g_engfuncs.GetClientTime();
+
+    for (BEAM *beam = s_activeBeams; beam; beam = beam->next)
     {
-        Vector3 a1 = positions[i] + normals[i] * width;
-        Vector3 a2 = positions[i] - normals[i] * width;
-        Vector3 b1 = positions[i + 1] + normals[i + 1] * width;
-        Vector3 b2 = positions[i + 1] - normals[i + 1] * width;
+        if (beam->type != TE_BEAMFOLLOW || !(beam->flags & FBEAM_STARTENTITY))
+        {
+            continue;
+        }
 
-        // every segment maps the whole texture once
-        g_triapiGL3.Brightness(brightness[i]);
-        g_triapiGL3.TexCoord2f(0, 0);
-        g_triapiGL3.Vertex3fv(&a1.x);
+        if (BEAMENT_ENTITY(beam->startEntity) != entity)
+        {
+            continue;
+        }
 
-        g_triapiGL3.Brightness(brightness[i]);
-        g_triapiGL3.TexCoord2f(1, 0);
-        g_triapiGL3.Vertex3fv(&a2.x);
+        // several trails started together for one entity (core + glow) must not detach each other
+        int index = BeamIndex(*beam);
+        if (index >= 0 && now - s_beamBirth[index] < 0.05f)
+        {
+            continue;
+        }
 
-        g_triapiGL3.Brightness(brightness[i + 1]);
-        g_triapiGL3.TexCoord2f(1, 1);
-        g_triapiGL3.Vertex3fv(&b2.x);
-
-        g_triapiGL3.Brightness(brightness[i + 1]);
-        g_triapiGL3.TexCoord2f(0, 1);
-        g_triapiGL3.Vertex3fv(&b1.x);
+        BeamDetachFollow(*beam, now);
     }
 }
 
@@ -773,7 +920,35 @@ static void DrawBeam(BEAM &beam, float frametime)
                 return;
             }
 
-            if (startEntity->model && (!beam.pFollowModel || beam.pFollowModel == startEntity->model))
+            bool following = true;
+
+            if (beam.type == TE_BEAMFOLLOW)
+            {
+                int index = BeamIndex(beam);
+
+                if (index >= 0 && BeamEntityIsLive(startEntity))
+                {
+                    s_beamLastLive[index] = clientTime;
+                }
+                else
+                {
+                    // The entity is not in the latest server update: it has not arrived yet (brand new trail), is
+                    // temporarily not sent, or it is gone and its cl_entities slot only holds stale data.
+                    // Never read the stale slot. Keep the last known head for a moment, then let go of the entity.
+                    following = false;
+
+                    if (index >= 0 && clientTime - s_beamLastLive[index] > BeamFollowGrace)
+                    {
+                        BeamDetachFollow(beam, clientTime);
+                    }
+                }
+            }
+
+            if (!following)
+            {
+                // nothing to update, a trail that never saw its entity has nothing to draw (STARTVISIBLE check below)
+            }
+            else if (startEntity->model && (!beam.pFollowModel || beam.pFollowModel == startEntity->model))
             {
                 beam.source = GetAttachmentPoint(startEntity, BEAMENT_ATTACHMENT(beam.startEntity));
                 beam.flags |= FBEAM_STARTVISIBLE;

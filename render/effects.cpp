@@ -726,6 +726,9 @@ static BEAM *R_BeamFollow(int startEnt, int modelIndex, float life, float width,
         return nullptr;
     }
 
+    // entity slots get reused: trails of the previous owner of this index must not hop over to the new entity
+    beamDetachFollowers(BEAMENT_ENTITY(startEnt));
+
     BEAM *beam = beamAllocate();
     if (!beam)
     {

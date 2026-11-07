@@ -240,11 +240,14 @@ static int SpriteTexture(struct model_s *pSpriteModel, int frame)
 
 static int WorldToScreen(float *world, float *screen)
 {
-    if (!g_state.inFrame) // fixme
+    if (!g_state.inFrame && !g_state.active)
     {
         return g_triapiGL1.WorldToScreen(world, screen);
     }
 
+    // Outside of the 3D frame (HUD_Redraw, MetaHook plugins like MetaDrawer) the engine's own GL1 matrices
+    // are not maintained while we are the renderer. The view/projection matrices of the frame that was just
+    // rendered are exactly what is on screen (FOV, Hor+, aspect), so use those.
     return hudWorldToScreen(world, screen[0], screen[1]);
 }
 

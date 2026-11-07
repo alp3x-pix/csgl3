@@ -25,6 +25,10 @@ cl_entity_t *beamGetBeamEntity(int index);
 // TE_KILLBEAM: detach/retire every beam attached to the given entity
 void beamKillEntity(int deadEntity);
 
+// a new TE_BEAMFOLLOW is about to start on this entity index: older trails still attached to the
+// same index belong to an entity that no longer exists (the slot got reused), so let them go
+void beamDetachFollowers(int entity);
+
 void beamDraw();
 
 }
